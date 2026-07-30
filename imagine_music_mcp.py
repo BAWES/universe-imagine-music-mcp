@@ -261,8 +261,42 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 # ── Entrypoint ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Wrap the FastMCP ASGI app with auth middleware
+    import threading
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
     mcp_asgi = app.streamable_http_app()
     mcp_asgi.add_middleware(BearerAuthMiddleware)
-    import uvicorn
-    uvicorn.run(mcp_asgi, host=HOST, port=PORT, forwarded_allow_ips="*")
+    _start_time = time.time()
+
+    async def _health_endpoint(request):
+        """Server health check. Excluded from auth."""
+        return JSONResponse({
+            "status": "ok",
+            "service": "Imagine Music MCP",
+            "ace_step_api": ACESTEP_API_URL,
+            "uptime_seconds": int(time.time() - _start_time),
+        })
+
+    # Health endpoint on PORT + 2 (same pattern as Designer MCP)
+    health_app = Starlette(routes=[
+        Route("/health", endpoint=_health_endpoint),
+    ])
+
+    def run_mcp():
+        uvicorn.run(mcp_asgi, host=HOST, port=PORT, log_level="info", forwarded_allow_ips="*")
+
+    def run_health():
+        uvicorn.run(health_app, host=HOST, port=PORT + 2, log_level="info")
+
+    t1 = threading.Thread(target=run_mcp, daemon=True)
+    t2 = threading.Thread(target=run_health, daemon=True)
+    t1.start()
+    t2.start()
+
+    print(f"[ImagineMusicMCP] Starting servers...")
+    print(f"[ImagineMusicMCP]   MCP:     http://{HOST}:{PORT}/mcp")
+    print(f"[ImagineMusicMCP]   Health:  http://{HOST}:{PORT + 2}/health")
+
+    t1.join()
