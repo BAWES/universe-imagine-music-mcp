@@ -61,19 +61,6 @@ def _api_post(path: str, body: dict, timeout: int = 120) -> dict:
         raise RuntimeError(f"ACE API unreachable at {url}: {e.reason}")
 
 
-def _api_get(path: str, timeout: int = 30) -> dict:
-    """GET from the local ACE Step API."""
-    url = f"{ACESTEP_API_URL}{path}"
-    req = urllib.request.Request(url, method="GET")
-    try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        result = json.loads(resp.read().decode())
-        return result.get("data") or result
-    except urllib.error.HTTPError as e:
-        body_text = e.read().decode(errors="replace")
-        raise RuntimeError(f"ACE API {e.code} on GET {path}: {body_text[:500]}")
-
-
 def _extract_file_path(item: dict) -> str:
     """Extract the local audio file path from a generation result item."""
     raw_file = item.get("file", "")
@@ -247,20 +234,6 @@ def get_generation(ctx: Context, task_id: str) -> str:
         return _format_generation(data[0])
     except RuntimeError as e:
         return [{"type": "text", "text": json.dumps({"error": str(e)})}]
-
-
-@app.tool()
-def list_generations(ctx: Context, limit: int = 10) -> str:
-    """List the most recent generations from the API.
-
-    Args:
-        limit: Maximum number of results to return (default 10, max 50).
-    """
-    try:
-        stats = _api_get("/v1/stats")
-        return json.dumps(stats, default=str)
-    except RuntimeError as e:
-        return json.dumps({"error": str(e)})
 
 
 # ── Auth Middleware ─────────────────────────────────────────────────────
