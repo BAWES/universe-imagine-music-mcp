@@ -16,6 +16,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import TextContent, EmbeddedResource
+from mcp.types import BlobResourceContents
 
 # ── Monkey-patch FastMCP's DNS rebinding check ──────────────────────────
 # FastMCP's TransportSecurityMiddleware rejects valid Host headers when the
@@ -67,7 +69,7 @@ def _extract_file_path(item: dict) -> str:
     return raw_file.replace("/v1/audio?path=", "").strip('"')
 
 
-def _audio_as_resource(file_path: str) -> dict:
+def _audio_as_resource(file_path: str) -> EmbeddedResource:
     """Read an audio file and return it as a base64 MCP resource blob.
 
     Same pattern as ElevenLabs MCP — bot-server's PR #348 fix handles
@@ -75,19 +77,19 @@ def _audio_as_resource(file_path: str) -> dict:
     """
     path = Path(file_path)
     if not path.exists():
-        return {"type": "text", "text": f"Audio file not found: {file_path}"}
+        return TextContent(type="text", text=f"Audio file not found: {file_path}")
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
-    return {
-        "type": "resource",
-        "resource": {
-            "blob": b64,
-            "mimeType": "audio/mpeg",
-        },
-    }
+    return EmbeddedResource(
+        type="resource",
+        resource=BlobResourceContents(
+            blob=b64,
+            mimeType="audio/mpeg",
+        ),
+    )
 
 
-def _format_generation(result: dict) -> list:
+def _format_generation(result: dict) -> list[TextContent | EmbeddedResource]:
     """Parse a generation result and return MCP content items.
 
     Returns audio as base64 resource blob + text metadata.
@@ -98,9 +100,9 @@ def _format_generation(result: dict) -> list:
     except (json.JSONDecodeError, TypeError):
         items = []
     if not items:
-        return [{"type": "text", "text": json.dumps({
+        return [TextContent(type="text", text=json.dumps({
             "status": "pending", "task_id": result.get("task_id", ""),
-        })}]
+        }))]
 
     item = items[0]
     file_path = _extract_file_path(item)
@@ -118,10 +120,10 @@ def _format_generation(result: dict) -> list:
         "generation_info": item.get("generation_info", ""),
     }
 
-    content = []
+    content: list[TextContent | EmbeddedResource] = []
     if file_path and status == "completed":
         content.append(_audio_as_resource(file_path))
-    content.append({"type": "text", "text": json.dumps(meta, indent=2)})
+    content.append(TextContent(type="text", text=json.dumps(meta, indent=2)))
     return content
 
 
@@ -159,7 +161,7 @@ def _generate_music_fn(
     inference_steps: int = 8,
     bpm: Optional[int] = None,
     key: str = "",
-) -> str:
+) -> list[TextContent | EmbeddedResource]:
     """Generate music from a text description."""
     # Map quality alias to actual model ID
     model = _MODEL_MAP.get(quality, "acestep-v15-turbo")
@@ -182,7 +184,7 @@ def _generate_music_fn(
         data_blob = result.get("data", result)
         task_id = data_blob.get("task_id", "")
         if not task_id:
-            return json.dumps({"error": "No task ID returned from ACE API"})
+            return [TextContent(type="text", text=json.dumps({"error": "No task ID returned from ACE API"}))]
 
         # Poll until done (sync with timeout)
         start = time.time()
@@ -198,14 +200,14 @@ def _generate_music_fn(
                 return _format_generation(data[0])
             time.sleep(2)
 
-        return [{"type": "text", "text": json.dumps({
+        return [TextContent(type="text", text=json.dumps({
             "status": "timeout",
             "task_id": task_id,
             "message": f"Generation did not complete within {max_wait}s. "
                        f"Check result with get_generation(task_id='{task_id}').",
-        })}]
+        }))]
     except RuntimeError as e:
-        return [{"type": "text", "text": json.dumps({"error": str(e)})}]
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
 
 # Register generate_music with dynamic docstring
@@ -214,7 +216,7 @@ generate_music = app.tool(name="generate_music")(_generate_music_fn)
 
 
 @app.tool()
-def get_generation(ctx: Context, task_id: str) -> str:
+def get_generation(ctx: Context, task_id: str) -> list[TextContent | EmbeddedResource]:
     """Check the status and result of a previous generation by task ID.
 
     Args:
@@ -226,14 +228,14 @@ def get_generation(ctx: Context, task_id: str) -> str:
         })
         data = result if isinstance(result, list) else result.get("data", [])
         if not data:
-            return [{"type": "text", "text": json.dumps({
+            return [TextContent(type="text", text=json.dumps({
                 "status": "not_found",
                 "task_id": task_id,
                 "message": "No result found for this task ID",
-            })}]
+            }))]
         return _format_generation(data[0])
     except RuntimeError as e:
-        return [{"type": "text", "text": json.dumps({"error": str(e)})}]
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
 
 # ── Auth Middleware ─────────────────────────────────────────────────────
