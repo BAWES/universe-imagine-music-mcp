@@ -138,32 +138,44 @@ def _format_generation(result: dict) -> list:
     return content
 
 
+# Simple model map: plain-language aliases → internal model IDs.
+# Both are always listed — XL download is handled by the user later.
+_MODEL_MAP = {
+    "fast": "acestep-v15-turbo",
+    "best_quality": "acestep-v15-xl-sft",
+}
+_MODEL_DESC = '"fast" — quick generation (~7s), or "best_quality" — highest quality (~10-30s)'
+
+
 # ── Tools ───────────────────────────────────────────────────────────────
 
-@app.tool()
-def generate_music(
-    ctx: Context,
-    prompt: str,
-    duration: int = 15,
-    model: str = "acestep-v15-turbo",
-    lyrics: str = "",
-    inference_steps: int = 8,
-    bpm: Optional[int] = None,
-    key: str = "",
-) -> str:
-    """Generate music from a text description.
+_GEN_DOC = f"""Generate music from a text description.
 
     Args:
         prompt: Text description of the music to generate (e.g. "a chill lo-fi beat
             with smooth piano and soft drums").
         duration: Length of the generated audio in seconds (10-600, default 15).
-        model: Model to use. "acestep-v15-turbo" (fast, ~7s), "acestep-v15-xl-sft"
-            (best quality, ~10-30s), or other installed models.
+        quality: Quality setting — {_MODEL_DESC}.
+        inference_steps: Quality vs speed (8 for fast, 50 for best quality).
         lyrics: Optional lyrics text. If empty, generates instrumental.
-        inference_steps: Quality vs speed (8 for turbo, 50 for XL).
         bpm: Optional tempo override (e.g. 86).
         key: Optional key (e.g. "F major").
     """
+
+
+def _generate_music_fn(
+    ctx: Context,
+    prompt: str,
+    duration: int = 15,
+    quality: str = "fast",
+    lyrics: str = "",
+    inference_steps: int = 8,
+    bpm: Optional[int] = None,
+    key: str = "",
+) -> str:
+    """Generate music from a text description."""
+    # Map quality alias to actual model ID
+    model = _MODEL_MAP.get(quality, "acestep-v15-turbo")
     body = {
         "prompt": prompt,
         "model": model,
@@ -207,6 +219,11 @@ def generate_music(
         })}]
     except RuntimeError as e:
         return [{"type": "text", "text": json.dumps({"error": str(e)})}]
+
+
+# Register generate_music with dynamic docstring
+_generate_music_fn.__doc__ = _GEN_DOC
+generate_music = app.tool(name="generate_music")(_generate_music_fn)
 
 
 @app.tool()
