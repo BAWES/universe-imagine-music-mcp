@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -66,7 +67,9 @@ def _api_post(path: str, body: dict, timeout: int = 120) -> dict:
 def _extract_file_path(item: dict) -> str:
     """Extract the local audio file path from a generation result item."""
     raw_file = item.get("file", "")
-    return raw_file.replace("/v1/audio?path=", "").strip('"')
+    # Remove /v1/audio?path= prefix and URL-decode
+    cleaned = raw_file.replace("/v1/audio?path=", "").strip('"')
+    return urllib.parse.unquote(cleaned)
 
 
 def _audio_as_resource(file_path: str) -> EmbeddedResource:
@@ -83,6 +86,7 @@ def _audio_as_resource(file_path: str) -> EmbeddedResource:
     return EmbeddedResource(
         type="resource",
         resource=BlobResourceContents(
+            uri=f"audio://{Path(file_path).name}",
             blob=b64,
             mimeType="audio/mpeg",
         ),
@@ -197,7 +201,14 @@ def _generate_music_fn(
                    poll_result.get("data", [])
 
             if data and data[0].get("result"):
-                return _format_generation(data[0])
+                # Only return when the inner result has status=1 (completed)
+                raw = data[0].get("result", "[]")
+                try:
+                    inner = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError):
+                    inner = []
+                if inner and inner[0].get("status") == 1:
+                    return _format_generation(data[0])
             time.sleep(2)
 
         return [TextContent(type="text", text=json.dumps({
