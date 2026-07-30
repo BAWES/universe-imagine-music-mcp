@@ -4,6 +4,7 @@ Same pattern as Designer MCP: calls local REST API, Streamable HTTP transport,
 monkey-patches TransportSecurityMiddleware for Cloudflare tunnel compat.
 """
 
+import base64
 import json
 import os
 import sys
@@ -34,11 +35,10 @@ _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path, override=True)
 
-PORT = int(os.getenv("PORT", "8006"))
+PORT = int(os.getenv("PORT", "8207"))
 HOST = os.getenv("HOST", "0.0.0.0")
 ACESTEP_API_URL = os.getenv("ACESTEP_API_URL", "http://localhost:8001")
 API_KEY = os.getenv("API_KEY", "")
-PUBLIC_URL_BASE = os.getenv("PUBLIC_URL_BASE", "http://localhost:8006")
 
 app = FastMCP("Imagine Music", port=PORT, host=HOST)
 
@@ -74,28 +74,54 @@ def _api_get(path: str, timeout: int = 30) -> dict:
         raise RuntimeError(f"ACE API {e.code} on GET {path}: {body_text[:500]}")
 
 
-def _audio_url(file_path: str) -> str:
-    """Convert a local filesystem path to a public URL."""
-    name = Path(file_path).name
-    return f"{PUBLIC_URL_BASE}/audio/{name}"
+def _extract_file_path(item: dict) -> str:
+    """Extract the local audio file path from a generation result item."""
+    raw_file = item.get("file", "")
+    return raw_file.replace("/v1/audio?path=", "").strip('"')
 
 
-def _format_generation(result: dict) -> dict:
-    """Parse a generation result dict into a clean output."""
+def _audio_as_resource(file_path: str) -> dict:
+    """Read an audio file and return it as a base64 MCP resource blob.
+
+    Same pattern as ElevenLabs MCP — bot-server's PR #348 fix handles
+    uploading this to CDN automatically.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        return {"type": "text", "text": f"Audio file not found: {file_path}"}
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return {
+        "type": "resource",
+        "resource": {
+            "blob": b64,
+            "mimeType": "audio/mpeg",
+        },
+    }
+
+
+def _format_generation(result: dict) -> list:
+    """Parse a generation result and return MCP content items.
+
+    Returns audio as base64 resource blob + text metadata.
+    """
     raw = result.get("result", "[]")
     try:
         items = json.loads(raw) if isinstance(raw, str) else raw
     except (json.JSONDecodeError, TypeError):
         items = []
     if not items:
-        return {"status": "pending", "task_id": result.get("task_id", "")}
+        return [{"type": "text", "text": json.dumps({
+            "status": "pending", "task_id": result.get("task_id", ""),
+        })}]
+
     item = items[0]
-    file_path = item.get("file", "").replace("/v1/audio?path=", "").strip('"')
-    audio_url = _audio_url(file_path) if file_path else ""
-    return {
-        "status": "completed" if item.get("status") == 1 else "failed",
+    file_path = _extract_file_path(item)
+    status = "completed" if item.get("status") == 1 else "failed"
+
+    meta = {
+        "status": status,
         "task_id": result.get("task_id", ""),
-        "audio_url": audio_url,
         "duration_s": item.get("metas", {}).get("duration", 0),
         "bpm": item.get("metas", {}).get("bpm", "N/A"),
         "key": item.get("metas", {}).get("keyscale", "N/A"),
@@ -104,6 +130,12 @@ def _format_generation(result: dict) -> dict:
         "model": f"{item.get('dit_model', '')} + {item.get('lm_model', '')}",
         "generation_info": item.get("generation_info", ""),
     }
+
+    content = []
+    if file_path and status == "completed":
+        content.append(_audio_as_resource(file_path))
+    content.append({"type": "text", "text": json.dumps(meta, indent=2)})
+    return content
 
 
 # ── Tools ───────────────────────────────────────────────────────────────
@@ -164,21 +196,17 @@ def generate_music(
                    poll_result.get("data", [])
 
             if data and data[0].get("result"):
-                return json.dumps(
-                    _format_generation(data[0]),
-                    default=str,
-                    indent=2,
-                )
+                return _format_generation(data[0])
             time.sleep(2)
 
-        return json.dumps({
+        return [{"type": "text", "text": json.dumps({
             "status": "timeout",
             "task_id": task_id,
             "message": f"Generation did not complete within {max_wait}s. "
                        f"Check result with get_generation(task_id='{task_id}').",
-        })
+        })}]
     except RuntimeError as e:
-        return json.dumps({"error": str(e)})
+        return [{"type": "text", "text": json.dumps({"error": str(e)})}]
 
 
 @app.tool()
@@ -194,14 +222,14 @@ def get_generation(ctx: Context, task_id: str) -> str:
         })
         data = result if isinstance(result, list) else result.get("data", [])
         if not data:
-            return json.dumps({
+            return [{"type": "text", "text": json.dumps({
                 "status": "not_found",
                 "task_id": task_id,
                 "message": "No result found for this task ID",
-            })
-        return json.dumps(_format_generation(data[0]), default=str, indent=2)
+            })}]
+        return _format_generation(data[0])
     except RuntimeError as e:
-        return json.dumps({"error": str(e)})
+        return [{"type": "text", "text": json.dumps({"error": str(e)})}]
 
 
 @app.tool()
@@ -213,7 +241,7 @@ def list_generations(ctx: Context, limit: int = 10) -> str:
     """
     try:
         stats = _api_get("/v1/stats")
-        return json.dumps(stats, default=str, indent=2)
+        return json.dumps(stats, default=str)
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
 
@@ -261,9 +289,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 # ── Entrypoint ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import threading
     import uvicorn
-    from starlette.applications import Starlette
     from starlette.routing import Route
 
     mcp_asgi = app.streamable_http_app()
@@ -271,7 +297,7 @@ if __name__ == "__main__":
     _start_time = time.time()
 
     async def _health_endpoint(request):
-        """Server health check. Excluded from auth."""
+        """Server health check. Excluded from auth by BearerAuthMiddleware."""
         return JSONResponse({
             "status": "ok",
             "service": "Imagine Music MCP",
@@ -279,24 +305,10 @@ if __name__ == "__main__":
             "uptime_seconds": int(time.time() - _start_time),
         })
 
-    # Health endpoint on PORT + 2 (same pattern as Designer MCP)
-    health_app = Starlette(routes=[
-        Route("/health", endpoint=_health_endpoint),
-    ])
+    # Add health route directly to the MCP ASGI app
+    mcp_asgi.router.routes.insert(0, Route("/health", endpoint=_health_endpoint))
 
-    def run_mcp():
-        uvicorn.run(mcp_asgi, host=HOST, port=PORT, log_level="info", forwarded_allow_ips="*")
-
-    def run_health():
-        uvicorn.run(health_app, host=HOST, port=PORT + 2, log_level="info")
-
-    t1 = threading.Thread(target=run_mcp, daemon=True)
-    t2 = threading.Thread(target=run_health, daemon=True)
-    t1.start()
-    t2.start()
-
-    print(f"[ImagineMusicMCP] Starting servers...")
-    print(f"[ImagineMusicMCP]   MCP:     http://{HOST}:{PORT}/mcp")
-    print(f"[ImagineMusicMCP]   Health:  http://{HOST}:{PORT + 2}/health")
-
-    t1.join()
+    print(f"[ImagineMusicMCP] Starting on http://{HOST}:{PORT}")
+    print(f"[ImagineMusicMCP]   MCP:     /mcp")
+    print(f"[ImagineMusicMCP]   Health:  /health (excluded from auth)")
+    uvicorn.run(mcp_asgi, host=HOST, port=PORT, log_level="info", forwarded_allow_ips="*")
