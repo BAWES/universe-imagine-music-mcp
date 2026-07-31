@@ -100,6 +100,13 @@ def _start_api() -> bool:
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
+                    env={
+                        **os.environ,
+                        # 1.7B LM: designed default for turbo, faster cold start,
+                        # 4GB lighter than the 4B LM. DeepSeek (bot-side) writes
+                        # lyrics; this LM plans audio codes inside ACE Step.
+                        "ACESTEP_LM_MODEL_PATH": "acestep-5Hz-lm-1.7B",
+                    },
                 )
             except Exception as exc:
                 raise RuntimeError(f"Failed to spawn ACE API: {exc}")
