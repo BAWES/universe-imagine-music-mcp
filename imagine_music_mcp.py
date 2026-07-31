@@ -1,13 +1,20 @@
 """
 Imagine Music MCP — FastMCP server wrapping ACE Step local API.
-Same pattern as Designer MCP: calls local REST API, Streamable HTTP transport,
-monkey-patches TransportSecurityMiddleware for Cloudflare tunnel compat.
+Same pattern as Designer MCP: the MCP server owns the ACE Step API lifecycle.
+
+- MCP server always runs (~50MB RAM, 0 GPU)
+- On first tool call: spawns the ACE Step API if not running, waits for it to boot
+- After IDLE_TIMEOUT of no calls: kills the API process -> VRAM fully freed
+- API runs turbo (fast model) so cold start is quick; XL-sft is used via the
+  local WebUI (localhost:3000) with a manually started API instead.
 """
 
 import base64
 import json
 import os
+import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -42,13 +49,104 @@ PORT = int(os.getenv("PORT", "8207"))
 HOST = os.getenv("HOST", "0.0.0.0")
 ACESTEP_API_URL = os.getenv("ACESTEP_API_URL", "http://localhost:8001")
 API_KEY = os.getenv("API_KEY", "")
+ACE_STEP_DIR = os.getenv("ACE_STEP_DIR", str(Path.home() / "ACE-Step-1.5"))
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # 5 min, matches Designer MCP
 
 app = FastMCP("Imagine Music", port=PORT, host=HOST)
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# ── ACE Step API lifecycle (Designer MCP pattern) ──────────────────────
+# The MCP server spawns the API on demand and kills it after idle,
+# so VRAM is only used while actually generating.
+_api_proc: Optional[subprocess.Popen] = None
+_last_api_call = time.monotonic()
+_LIFECYCLE_LOCK = threading.Lock()
+
+
+def _api_healthy() -> bool:
+    """Return True if the ACE Step API responds on /health."""
+    try:
+        with urllib.request.urlopen(ACESTEP_API_URL + "/health", timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _start_api() -> bool:
+    """Spawn the ACE Step API if not running. Waits up to 60s for boot.
+
+    Returns True when the API is healthy. Does NOT return early errors to
+    callers — it blocks until the API is ready or the boot window expires,
+    so the bot never sees a "service down" message during startup.
+    """
+    global _api_proc
+    if _api_healthy():
+        return True
+
+    with _LIFECYCLE_LOCK:
+        if _api_healthy():
+            return True
+
+        # If we own a process but it's mid-boot, just wait for it.
+        if _api_proc is None or _api_proc.poll() is not None:
+            log_path = Path(ACE_STEP_DIR) / "acestep_api.log"
+            log_handle = open(log_path, "ab")
+            try:
+                _api_proc = subprocess.Popen(
+                    [
+                        str(Path(ACE_STEP_DIR) / ".venv" / "bin" / "acestep-api"),
+                        "--port", str(8001),
+                    ],
+                    cwd=ACE_STEP_DIR,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to spawn ACE API: {exc}")
+
+    # Wait for the API to come up (covers boot + initial model check).
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if _api_healthy():
+            return True
+        time.sleep(2)
+    return False
+
+
+def _stop_api() -> None:
+    """Kill the API process we spawned (frees all VRAM)."""
+    global _api_proc
+    with _LIFECYCLE_LOCK:
+        if _api_proc is None:
+            return
+        proc = _api_proc
+        _api_proc = None
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+
+
+def _idle_watchdog() -> None:
+    """Background thread: kill the API after IDLE_TIMEOUT with no calls."""
+    while True:
+        time.sleep(30)
+        if time.monotonic() - _last_api_call > IDLE_TIMEOUT:
+            _stop_api()
+
 
 def _api_post(path: str, body: dict, timeout: int = 120) -> dict:
-    """POST to the local ACE Step API and return parsed JSON data."""
+    """POST to the local ACE Step API and return parsed JSON data.
+
+    Ensures the API is running first (spawns + waits for boot on demand).
+    """
+    global _last_api_call
+    if not _start_api():
+        raise RuntimeError("ACE API failed to start within 60s")
+    _last_api_call = time.monotonic()
+
     url = f"{ACESTEP_API_URL}{path}"
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
@@ -298,13 +396,18 @@ if __name__ == "__main__":
             "status": "ok",
             "service": "Imagine Music MCP",
             "ace_step_api": ACESTEP_API_URL,
+            "api_running": _api_healthy(),
             "uptime_seconds": int(time.time() - _start_time),
         })
 
     # Add health route directly to the MCP ASGI app
     mcp_asgi.router.routes.insert(0, Route("/health", endpoint=_health_endpoint))
 
+    # Idle watchdog: kills the ACE API after IDLE_TIMEOUT so VRAM is freed
+    threading.Thread(target=_idle_watchdog, daemon=True).start()
+
     print(f"[ImagineMusicMCP] Starting on http://{HOST}:{PORT}")
     print(f"[ImagineMusicMCP]   MCP:     /mcp")
     print(f"[ImagineMusicMCP]   Health:  /health (excluded from auth)")
+    print(f"[ImagineMusicMCP]   ACE API: spawned on demand, killed after {IDLE_TIMEOUT}s idle")
     uvicorn.run(mcp_asgi, host=HOST, port=PORT, log_level="info", forwarded_allow_ips="*")
