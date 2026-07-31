@@ -131,13 +131,10 @@ def _format_generation(result: dict) -> list[TextContent | EmbeddedResource]:
     return content
 
 
-# Simple model map: plain-language aliases → internal model IDs.
-# Both are always listed — XL download is handled by the user later.
-_MODEL_MAP = {
-    "fast": "acestep-v15-turbo",
-    "best_quality": "acestep-v15-xl-sft",
-}
-_MODEL_DESC = '"fast" — quick generation (~7s), or "best_quality" — highest quality (~10-30s)'
+# Single model: highest quality (XL-sft) — the only option.
+# Pin inference_steps high for quality; the API lazy-loads XL on first call.
+_MODEL_ID = "acestep-v15-xl-sft"
+_DEFAULT_INFERENCE_STEPS = 50
 
 
 # ── Tools ───────────────────────────────────────────────────────────────
@@ -148,8 +145,7 @@ _GEN_DOC = f"""Generate music from a text description.
         prompt: Text description of the music to generate (e.g. "a chill lo-fi beat
             with smooth piano and soft drums").
         duration: Length of the generated audio in seconds (10-600, default 15).
-        quality: Quality setting — {_MODEL_DESC}.
-        inference_steps: Quality vs speed (8 for fast, 50 for best quality).
+        inference_steps: Generation quality — higher = better but slower (default 50).
         lyrics: Optional lyrics text. If empty, generates instrumental.
         bpm: Optional tempo override (e.g. 86).
         key: Optional key (e.g. "F major").
@@ -160,18 +156,15 @@ def _generate_music_fn(
     ctx: Context,
     prompt: str,
     duration: int = 15,
-    quality: str = "fast",
     lyrics: str = "",
-    inference_steps: int = 8,
+    inference_steps: int = _DEFAULT_INFERENCE_STEPS,
     bpm: Optional[int] = None,
     key: str = "",
 ) -> list[TextContent | EmbeddedResource]:
     """Generate music from a text description."""
-    # Map quality alias to actual model ID
-    model = _MODEL_MAP.get(quality, "acestep-v15-turbo")
     body = {
         "prompt": prompt,
-        "model": model,
+        "model": _MODEL_ID,
         "thinking": True,
         "inference_steps": inference_steps,
         "duration": duration,
