@@ -131,10 +131,10 @@ def _format_generation(result: dict) -> list[TextContent | EmbeddedResource]:
     return content
 
 
-# Single model: highest quality (XL-sft) — the only option.
-# Pin inference_steps high for quality; the API lazy-loads XL on first call.
-_MODEL_ID = "acestep-v15-xl-sft"
-_DEFAULT_INFERENCE_STEPS = 50
+# Single model: fast (turbo) — the only option for the bot.
+# Light enough to keep loaded at all times; XL-sft is used via the local WebUI instead.
+_MODEL_ID = "acestep-v15-turbo"
+_DEFAULT_INFERENCE_STEPS = 8
 
 
 # ── Tools ───────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ _GEN_DOC = f"""Generate music from a text description.
         prompt: Text description of the music to generate (e.g. "a chill lo-fi beat
             with smooth piano and soft drums").
         duration: Length of the generated audio in seconds (10-600, default 15).
-        inference_steps: Generation quality — higher = better but slower (default 50).
+        inference_steps: Generation quality — higher = better but slower (default 8).
         lyrics: Optional lyrics text. If empty, generates instrumental.
         bpm: Optional tempo override (e.g. 86).
         key: Optional key (e.g. "F major").
