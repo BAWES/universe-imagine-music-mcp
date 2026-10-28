@@ -7,6 +7,15 @@ Same pattern as Designer MCP: the MCP server owns the ACE Step API lifecycle.
 - After IDLE_TIMEOUT of no calls: kills the API process -> VRAM fully freed
 - API runs turbo (fast model) so cold start is quick; XL-sft is used via the
   local WebUI (localhost:3000) with a manually started API instead.
+
+Tool results follow the Universe contract: a short plain sentence plus a
+direct media item on success, and `isError` with one plain sentence on
+failure. Internal detail (URLs, ports, paths, API bodies) only ever goes
+to the log file, never into a tool result.
+
+The generation request itself is unchanged: same model, same
+inference_steps, same duration default, same ACE Step API, so audio
+quality is identical to before this change.
 """
 
 import base64
@@ -21,13 +30,19 @@ import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import requests as http_requests
 from dotenv import load_dotenv
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP, Context
-from mcp.types import TextContent, EmbeddedResource
-from mcp.types import BlobResourceContents
+from mcp.types import (
+    BlobResourceContents,
+    CallToolResult,
+    EmbeddedResource,
+    TextContent,
+    ToolAnnotations,
+)
 
 # ── Monkey-patch FastMCP's DNS rebinding check ──────────────────────────
 # FastMCP's TransportSecurityMiddleware rejects valid Host headers when the
@@ -56,6 +71,48 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # 5 min, matches Designer 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 app = FastMCP("Imagine Music", port=PORT, host=HOST)
+
+# ── Response rules (Universe contract) ─────────────────────────────────
+# Universe abandons a tool call after 90s by default, so boot + generation
+# together must finish well inside that window or the player sees a failed
+# step while the song is still being made.
+_TOOL_BUDGET_S = 78.0        # whole tool call, leaving headroom under 90s
+_BOOT_WAIT_S = 40.0          # how long a spawn+boot may take on its own
+_REQUEST_TIMEOUT_S = 60.0    # release_task can carry a cold model load
+_POLL_INTERVAL_S = 2.0
+_MAX_AUDIO_BYTES = 10 * 1024 * 1024  # nearby chat keeps 10 MB per file
+_AUDIO_MIME = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg"}
+
+# Plain sentences only. Universe shows the first 80 characters on the
+# player's steps line and hands the rest to the model, and the owner pays
+# for every word — so one sentence, no URLs, ports, paths or API bodies.
+_PHRASES = {
+    "warming": "The music studio is warming up. Ask me again in a moment.",
+    "failed": "The studio couldn't finish that song. Try a simpler prompt.",
+    "too_big": "That song came out too big to send. Try a shorter one.",
+    "missing": "I couldn't find that song.",
+}
+_STILL_RENDERING = "Still rendering — ask me about song {task_id} in a moment."
+
+
+def _log(message: str) -> None:
+    """Write operational detail to the server log, never to a tool result."""
+    print(f"[ImagineMusicMCP] {message}")
+
+
+def _fail(reason: str, detail: str = "") -> CallToolResult:
+    """Return a one-sentence failure the player can read."""
+    if detail:
+        _log(f"failure[{reason}]: {detail}")
+    return CallToolResult(
+        content=[TextContent(type="text", text=_PHRASES[reason])],
+        isError=True,
+    )
+
+
+def _say(text: str) -> CallToolResult:
+    """Return a one-sentence success."""
+    return CallToolResult(content=[TextContent(type="text", text=text)])
 
 
 # ── Discord webhook (matches Designer MCP pattern) ──────────────────────
@@ -102,16 +159,18 @@ def send_discord(ctx: Context, generation: dict, audio_path: str = "") -> bool:
                     files={"file": (Path(audio_path).name, f, "audio/mpeg")},
                     timeout=15,
                 )
+            _log(f"Discord webhook ok ({resp.status_code}) for task {str(generation.get('task_id', ''))[:8]}")
             return resp.status_code in (200, 204)
         except Exception as e:
-            print(f"[ImagineMusicMCP] Discord webhook (with audio) failed: {e}")
+            _log(f"Discord webhook (with audio) failed: {e}")
             return False
 
     try:
         resp = http_requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=15)
+        _log(f"Discord webhook ok ({resp.status_code}) for task {str(generation.get('task_id', ''))[:8]}")
         return resp.status_code in (200, 204)
     except Exception as e:
-        print(f"[ImagineMusicMCP] Discord webhook failed: {e}")
+        _log(f"Discord webhook failed: {e}")
         return False
 
 # ── ACE Step API lifecycle (Designer MCP pattern) ──────────────────────
@@ -120,6 +179,18 @@ def send_discord(ctx: Context, generation: dict, audio_path: str = "") -> bool:
 _api_proc: Optional[subprocess.Popen] = None
 _last_api_call = time.monotonic()
 _LIFECYCLE_LOCK = threading.Lock()
+
+# Task ids already posted to Discord, so a status poll never doubles up.
+_webhook_sent: set[str] = set()
+_webhook_lock = threading.Lock()
+
+
+class _StudioUnavailable(RuntimeError):
+    """The local music engine could not be reached or booted."""
+
+
+class _StudioError(RuntimeError):
+    """The music engine rejected the request or timed out."""
 
 
 def _api_healthy() -> bool:
@@ -131,12 +202,12 @@ def _api_healthy() -> bool:
         return False
 
 
-def _start_api() -> bool:
-    """Spawn the ACE Step API if not running. Waits up to 60s for boot.
+def _start_api(deadline: float) -> bool:
+    """Spawn the ACE Step API if not running and wait until `deadline`.
 
-    Returns True when the API is healthy. Does NOT return early errors to
-    callers — it blocks until the API is ready or the boot window expires,
-    so the bot never sees a "service down" message during startup.
+    `deadline` is an absolute time.monotonic() value owned by the caller, so
+    the boot wait can never push the tool call past Universe's 90s window.
+    Returns True when the API is healthy.
     """
     global _api_proc
     if _api_healthy():
@@ -149,8 +220,8 @@ def _start_api() -> bool:
         # If we own a process but it's mid-boot, just wait for it.
         if _api_proc is None or _api_proc.poll() is not None:
             log_path = Path(ACE_STEP_DIR) / "acestep_api.log"
-            log_handle = open(log_path, "ab")
             try:
+                log_handle = open(log_path, "ab")
                 _api_proc = subprocess.Popen(
                     [
                         str(Path(ACE_STEP_DIR) / ".venv" / "bin" / "acestep-api"),
@@ -170,10 +241,9 @@ def _start_api() -> bool:
                     },
                 )
             except Exception as exc:
-                raise RuntimeError(f"Failed to spawn ACE API: {exc}")
+                raise _StudioUnavailable(f"Failed to spawn ACE API: {exc}")
 
     # Wait for the API to come up (covers boot + initial model check).
-    deadline = time.monotonic() + 180  # cold boot (cached models) ~60-90s; downloads can exceed 60
     while time.monotonic() < deadline:
         if _api_healthy():
             return True
@@ -205,16 +275,26 @@ def _idle_watchdog() -> None:
             _stop_api()
 
 
-def _api_post(path: str, body: dict, timeout: int = 120) -> dict:
+def _api_post(
+    path: str,
+    body: dict,
+    timeout: float = _REQUEST_TIMEOUT_S,
+    deadline: Optional[float] = None,
+) -> dict:
     """POST to the local ACE Step API and return parsed JSON data.
 
     Ensures the API is running first (spawns + waits for boot on demand).
+    `deadline` is the absolute monotonic time the whole tool call must be
+    finished by; the HTTP wait is capped by whatever is left of it.
     """
     global _last_api_call
-    if not _start_api():
-        raise RuntimeError("ACE API failed to start within 60s")
+    if deadline is None:
+        deadline = time.monotonic() + _BOOT_WAIT_S + timeout
+    if not _start_api(deadline):
+        raise _StudioUnavailable("ACE API did not become healthy in time")
     _last_api_call = time.monotonic()
 
+    timeout = max(1.0, min(timeout, deadline - time.monotonic()))
     url = f"{ACESTEP_API_URL}{path}"
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
@@ -225,9 +305,11 @@ def _api_post(path: str, body: dict, timeout: int = 120) -> dict:
         return result.get("data") or result
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
-        raise RuntimeError(f"ACE API {e.code} on {path}: {body_text[:500]}")
+        raise _StudioError(f"ACE API {e.code} on {path}: {body_text[:500]}")
     except urllib.error.URLError as e:
-        raise RuntimeError(f"ACE API unreachable at {url}: {e.reason}")
+        raise _StudioUnavailable(f"ACE API unreachable at {url}: {e.reason}")
+    except TimeoutError as e:
+        raise _StudioError(f"ACE API timed out on {path}: {e}")
 
 
 def _extract_file_path(item: dict) -> str:
@@ -238,85 +320,130 @@ def _extract_file_path(item: dict) -> str:
     return urllib.parse.unquote(cleaned)
 
 
-def _audio_as_resource(file_path: str) -> EmbeddedResource:
-    """Read an audio file and return it as a base64 MCP resource blob.
-
-    Same pattern as ElevenLabs MCP — bot-server's PR #348 fix handles
-    uploading this to CDN automatically.
-    """
-    path = Path(file_path)
-    if not path.exists():
-        return TextContent(type="text", text=f"Audio file not found: {file_path}")
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    return EmbeddedResource(
-        type="resource",
-        resource=BlobResourceContents(
-            uri=f"audio://{Path(file_path).name}",
-            blob=b64,
-            mimeType="audio/mpeg",
-        ),
-    )
-
-
-def _format_generation(result: dict) -> list[TextContent | EmbeddedResource]:
-    """Parse a generation result and return MCP content items.
-
-    Returns audio as base64 resource blob + text metadata.
-    """
+def _parse_items(result: dict) -> list[dict]:
+    """Parse the JSON-encoded result items out of an ACE Step response."""
     raw = result.get("result", "[]")
     try:
         items = json.loads(raw) if isinstance(raw, str) else raw
     except (json.JSONDecodeError, TypeError):
         items = []
+    return items if isinstance(items, list) else []
+
+
+def _spoken_duration(item: dict) -> int:
+    """Return the generated length in whole seconds (0 when unknown)."""
+    try:
+        return int(float(item.get("metas", {}).get("duration", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _audio_as_resource(file_path: str) -> tuple[Optional[EmbeddedResource], Optional[str]]:
+    """Read an audio file and return it as a base64 MCP resource blob.
+
+    Only the formats Universe posts by itself (mp3, wav, ogg) and only files
+    under the nearby-chat size cap are attached. Returns (content, reason)
+    where reason is a key from _PHRASES when nothing can be attached.
+    """
+    path = Path(file_path)
+    mime = _AUDIO_MIME.get(path.suffix.lower())
+    if not mime:
+        _log(f"not a chat-sendable audio type: {path.suffix or 'no suffix'}")
+        return None, "failed"
+    if not path.exists():
+        _log(f"audio file missing on disk: {path.name}")
+        return None, "failed"
+    size = path.stat().st_size
+    if size > _MAX_AUDIO_BYTES:
+        _log(f"audio file too large: {size} bytes > {_MAX_AUDIO_BYTES}")
+        return None, "too_big"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return (
+        EmbeddedResource(
+            type="resource",
+            resource=BlobResourceContents(
+                uri=f"audio://{path.name}",
+                blob=b64,
+                mimeType=mime,
+            ),
+        ),
+        None,
+    )
+
+
+def _result_from_item(result: dict) -> CallToolResult:
+    """Build the tool result for one generation item.
+
+    Success is one short line plus the audio file. A job that is still
+    running returns a soft message carrying its song id, not an error.
+    """
+    task_id = result.get("task_id", "")
+    items = _parse_items(result)
     if not items:
-        return [TextContent(type="text", text=json.dumps({
-            "status": "pending", "task_id": result.get("task_id", ""),
-        }))]
+        return _say(_STILL_RENDERING.format(task_id=task_id))
 
     item = items[0]
-    file_path = _extract_file_path(item)
-    status = "completed" if item.get("status") == 1 else "failed"
+    status = item.get("status")
+    if status == 2:  # ACE Step "failed"
+        return _fail("failed", f"generation status 2 for task {task_id}")
+    if status != 1:  # queued / running
+        return _say(_STILL_RENDERING.format(task_id=task_id))
 
+    audio, reason = _audio_as_resource(_extract_file_path(item))
+    if audio is None:
+        return _fail(reason or "failed", f"no attachable audio for task {task_id}")
+
+    seconds = _spoken_duration(item)
+    line = f"Made a {seconds}s track." if seconds else "Made a track."
+    return CallToolResult(content=[TextContent(type="text", text=line), audio])
+
+
+def _notify_discord_once(ctx: Context, result: dict) -> None:
+    """Post a finished song to Discord, at most once per task.
+
+    A slow song can finish after generate_music has already answered with
+    "still rendering", so get_generation also calls this. The dedupe set
+    keeps a status poll from posting the same song twice.
+    """
+    items = _parse_items(result)
+    if not items or items[0].get("status") != 1:
+        return
+    task_id = result.get("task_id", "")
+    if not task_id:
+        return
+    with _webhook_lock:
+        if task_id in _webhook_sent:
+            return
+        _webhook_sent.add(task_id)
+        if len(_webhook_sent) > 500:
+            _webhook_sent.clear()
+    item = items[0]
     meta = {
-        "status": status,
-        "task_id": result.get("task_id", ""),
-        "duration_s": item.get("metas", {}).get("duration", 0),
+        "status": "completed",
+        "task_id": task_id,
+        "duration_s": _spoken_duration(item),
         "bpm": item.get("metas", {}).get("bpm", "N/A"),
         "key": item.get("metas", {}).get("keyscale", "N/A"),
         "seed": item.get("seed_value", ""),
         "prompt": item.get("prompt", ""),
-        "model": f"{item.get('dit_model', '')} + {item.get('lm_model', '')}",
-        "generation_info": item.get("generation_info", ""),
     }
+    threading.Thread(
+        target=send_discord,
+        args=(ctx, meta, _extract_file_path(item)),
+        daemon=True,
+    ).start()
 
-    content: list[TextContent | EmbeddedResource] = []
-    if file_path and status == "completed":
-        content.append(_audio_as_resource(file_path))
-    content.append(TextContent(type="text", text=json.dumps(meta, indent=2)))
-    return content
 
-
-def _complete_generation(ctx: Context, result: dict) -> list[TextContent | EmbeddedResource]:
+def _complete_generation(ctx: Context, result: dict) -> CallToolResult:
     """Format a completed generation and fire the Discord webhook.
 
-    Only called from generate_music (not get_generation) so a webhook
-    fires once per song, not on every status lookup.
+    Only called from generate_music (not get_generation) so a webhook fires
+    once per song, not on every status lookup. The webhook runs in a
+    background thread: its 15s HTTP timeout must not eat the tool's budget.
     """
-    content = _format_generation(result)
-    raw = result.get("result", "[]")
-    try:
-        items = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
-        items = []
-    if items:
-        item = items[0]
-        status = "completed" if item.get("status") == 1 else "failed"
-        if status == "completed":
-            file_path = _extract_file_path(item)
-            meta = json.loads(content[-1].text) if content else {}
-            send_discord(ctx, meta, audio_path=file_path)
-    return content
+    _notify_discord_once(ctx, result)
+    return _result_from_item(result)
 
 
 # Single model: fast (turbo) — the only option for the bot.
@@ -326,30 +453,34 @@ _DEFAULT_INFERENCE_STEPS = 8
 
 
 # ── Tools ───────────────────────────────────────────────────────────────
-
-_GEN_DOC = f"""Generate music from a text description.
-
-    Args:
-        prompt: Text description of the music to generate (e.g. "a chill lo-fi beat
-            with smooth piano and soft drums").
-        duration: Length of the generated audio in seconds (10-600, default 15).
-        inference_steps: Generation quality — higher = better but slower (default 8).
-        lyrics: Optional lyrics text. If empty, generates instrumental.
-        bpm: Optional tempo override (e.g. 86).
-        key: Optional key (e.g. "F major").
-    """
+# Nothing may escape a tool body as a raw exception: the SDK would wrap it as
+# "Error executing tool ... " and that prefix would eat the 80 characters
+# Universe shows the player. Every body runs through _run_guarded.
 
 
-def _generate_music_fn(
+def _run_guarded(fn, *args) -> CallToolResult:
+    """Run a tool body, turning any failure into one plain sentence."""
+    try:
+        return fn(*args)
+    except _StudioUnavailable as exc:
+        return _fail("warming", str(exc))
+    except _StudioError as exc:
+        return _fail("failed", str(exc))
+    except Exception as exc:  # noqa: BLE001 - a tool call must never raise
+        return _fail("failed", f"{type(exc).__name__}: {exc}")
+
+
+def _generate_music(
     ctx: Context,
     prompt: str,
-    duration: int = 15,
-    lyrics: str = "",
-    inference_steps: int = _DEFAULT_INFERENCE_STEPS,
-    bpm: Optional[int] = None,
-    key: str = "",
-) -> list[TextContent | EmbeddedResource]:
-    """Generate music from a text description."""
+    duration: int,
+    lyrics: str,
+    inference_steps: int,
+    bpm: Optional[int],
+    key: str,
+) -> CallToolResult:
+    """Generate one song and return either the audio or a still-rendering note."""
+    deadline = time.monotonic() + _TOOL_BUDGET_S
     body = {
         "prompt": prompt,
         "model": _MODEL_ID,
@@ -364,70 +495,112 @@ def _generate_music_fn(
     if key:
         body["key_scale"] = key
 
-    try:
-        result = _api_post("/release_task", body, timeout=120)
-        data_blob = result.get("data", result)
-        task_id = data_blob.get("task_id", "")
-        if not task_id:
-            return [TextContent(type="text", text=json.dumps({"error": "No task ID returned from ACE API"}))]
+    result = _api_post("/release_task", body, timeout=_REQUEST_TIMEOUT_S, deadline=deadline)
 
-        # Poll until done (sync with timeout)
-        start = time.time()
-        max_wait = 120
-        while time.time() - start < max_wait:
-            poll_result = _api_post("/query_result", {
-                "task_id_list": json.dumps([task_id]),
-            })
-            data = poll_result if isinstance(poll_result, list) else \
-                   poll_result.get("data", [])
+    data_blob = result.get("data", result) if isinstance(result, dict) else {}
+    task_id = data_blob.get("task_id", "") if isinstance(data_blob, dict) else ""
+    if not task_id:
+        return _fail("failed", f"no task_id in release_task response: {str(result)[:200]}")
 
-            if data and data[0].get("result"):
-                # Only return when the inner result has status=1 (completed)
-                raw = data[0].get("result", "[]")
-                try:
-                    inner = json.loads(raw) if isinstance(raw, str) else raw
-                except (json.JSONDecodeError, TypeError):
-                    inner = []
-                if inner and inner[0].get("status") == 1:
-                    return _complete_generation(ctx, data[0])
-            time.sleep(2)
+    # Poll until done, but never past the tool budget.
+    while deadline - time.monotonic() > 3.0:
+        remaining = deadline - time.monotonic()
+        try:
+            poll_result = _api_post(
+                "/query_result",
+                {"task_id_list": json.dumps([task_id])},
+                timeout=min(remaining, 30.0),
+                deadline=deadline,
+            )
+        except (_StudioUnavailable, _StudioError) as exc:
+            _log(f"poll failed for task {task_id}: {exc}")
+            break
 
-        return [TextContent(type="text", text=json.dumps({
-            "status": "timeout",
-            "task_id": task_id,
-            "message": f"Generation did not complete within {max_wait}s. "
-                       f"Check result with get_generation(task_id='{task_id}').",
-        }))]
-    except RuntimeError as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        data = poll_result if isinstance(poll_result, list) else poll_result.get("data", [])
+        if data and data[0].get("result"):
+            items = _parse_items(data[0])
+            if items and items[0].get("status") == 1:
+                return _complete_generation(ctx, data[0])
+            if items and items[0].get("status") == 2:
+                return _fail("failed", f"generation status 2 for task {task_id}")
+        time.sleep(min(_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
+
+    return _say(_STILL_RENDERING.format(task_id=task_id))
 
 
-# Register generate_music with dynamic docstring
-_generate_music_fn.__doc__ = _GEN_DOC
-generate_music = app.tool(name="generate_music")(_generate_music_fn)
+def _check_generation(ctx: Context, task_id: str) -> CallToolResult:
+    """Look up one song by id and return its audio once it is finished."""
+    result = _api_post(
+        "/query_result",
+        {"task_id_list": json.dumps([task_id])},
+        timeout=30.0,
+    )
+    data = result if isinstance(result, list) else result.get("data", [])
+    if not data:
+        return _fail("missing", f"no result for task {task_id}")
+    _notify_discord_once(ctx, data[0])
+    return _result_from_item(data[0])
 
 
-@app.tool()
-def get_generation(ctx: Context, task_id: str) -> list[TextContent | EmbeddedResource]:
-    """Check the status and result of a previous generation by task ID.
+@app.tool(
+    name="generate_music",
+    title="Generate music",
+    annotations=ToolAnnotations(
+        title="Generate music",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+    structured_output=False,
+)
+def generate_music(
+    ctx: Context,
+    prompt: Annotated[str, Field(
+        description="What the song should sound like, or what it is about.",
+    )],
+    duration: Annotated[int, Field(
+        description="Length of the song in seconds (10-600, default 15).",
+    )] = 15,
+    lyrics: Annotated[str, Field(
+        description="Words for a singer. Leave empty for instrumental music.",
+    )] = "",
+    inference_steps: Annotated[int, Field(
+        description="How much effort goes into each song. Higher can sound more polished but takes longer.",
+    )] = _DEFAULT_INFERENCE_STEPS,
+    bpm: Annotated[Optional[int], Field(
+        description="Tempo in beats per minute, when a specific speed matters.",
+    )] = None,
+    key: Annotated[str, Field(
+        description="Musical key, for example 'F major'.",
+    )] = "",
+) -> CallToolResult:
+    """Generate a song from a text description and send it back as audio."""
+    return _run_guarded(
+        _generate_music, ctx, prompt, duration, lyrics, inference_steps, bpm, key
+    )
 
-    Args:
-        task_id: The task ID returned from generate_music.
-    """
-    try:
-        result = _api_post("/query_result", {
-            "task_id_list": json.dumps([task_id]),
-        })
-        data = result if isinstance(result, list) else result.get("data", [])
-        if not data:
-            return [TextContent(type="text", text=json.dumps({
-                "status": "not_found",
-                "task_id": task_id,
-                "message": "No result found for this task ID",
-            }))]
-        return _format_generation(data[0])
-    except RuntimeError as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+@app.tool(
+    name="get_generation",
+    title="Check song status",
+    annotations=ToolAnnotations(
+        title="Check song status",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    structured_output=False,
+)
+def get_generation(
+    ctx: Context,
+    task_id: Annotated[str, Field(
+        description="The song id a previous request left behind.",
+    )],
+) -> CallToolResult:
+    """Check on a song that is still being made, using its song id."""
+    return _run_guarded(_check_generation, ctx, task_id)
 
 
 # ── Auth Middleware ─────────────────────────────────────────────────────
