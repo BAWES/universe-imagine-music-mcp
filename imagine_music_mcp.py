@@ -73,12 +73,8 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 app = FastMCP("Imagine Music", port=PORT, host=HOST)
 
 # ── Response rules (Universe contract) ─────────────────────────────────
-# Universe abandons a tool call after 90s by default, so boot + generation
-# together must finish well inside that window or the player sees a failed
-# step while the song is still being made.
-_TOOL_BUDGET_S = 78.0        # whole tool call, leaving headroom under 90s
-_BOOT_WAIT_S = 40.0          # how long a spawn+boot may take on its own
-_REQUEST_TIMEOUT_S = 60.0    # release_task can carry a cold model load
+# The wait limits stay where f236466 had them: the bot's own Patience setting
+# is what bounds a tool call, not a budget we invent here.
 _POLL_INTERVAL_S = 2.0
 _MAX_AUDIO_BYTES = 10 * 1024 * 1024  # nearby chat keeps 10 MB per file
 _AUDIO_MIME = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg"}
@@ -202,12 +198,12 @@ def _api_healthy() -> bool:
         return False
 
 
-def _start_api(deadline: float) -> bool:
-    """Spawn the ACE Step API if not running and wait until `deadline`.
+def _start_api() -> bool:
+    """Spawn the ACE Step API if not running. Waits up to 180s for boot.
 
-    `deadline` is an absolute time.monotonic() value owned by the caller, so
-    the boot wait can never push the tool call past Universe's 90s window.
-    Returns True when the API is healthy.
+    Returns True when the API is healthy. Does NOT return early errors to
+    callers — it blocks until the API is ready or the boot window expires,
+    so the bot never sees a "service down" message during startup.
     """
     global _api_proc
     if _api_healthy():
@@ -244,6 +240,7 @@ def _start_api(deadline: float) -> bool:
                 raise _StudioUnavailable(f"Failed to spawn ACE API: {exc}")
 
     # Wait for the API to come up (covers boot + initial model check).
+    deadline = time.monotonic() + 180  # cold boot (cached models) ~60-90s; downloads can exceed 60
     while time.monotonic() < deadline:
         if _api_healthy():
             return True
@@ -275,26 +272,16 @@ def _idle_watchdog() -> None:
             _stop_api()
 
 
-def _api_post(
-    path: str,
-    body: dict,
-    timeout: float = _REQUEST_TIMEOUT_S,
-    deadline: Optional[float] = None,
-) -> dict:
+def _api_post(path: str, body: dict, timeout: float = 120.0) -> dict:
     """POST to the local ACE Step API and return parsed JSON data.
 
     Ensures the API is running first (spawns + waits for boot on demand).
-    `deadline` is the absolute monotonic time the whole tool call must be
-    finished by; the HTTP wait is capped by whatever is left of it.
     """
     global _last_api_call
-    if deadline is None:
-        deadline = time.monotonic() + _BOOT_WAIT_S + timeout
-    if not _start_api(deadline):
-        raise _StudioUnavailable("ACE API did not become healthy in time")
+    if not _start_api():
+        raise _StudioUnavailable("ACE API failed to start within 180s")
     _last_api_call = time.monotonic()
 
-    timeout = max(1.0, min(timeout, deadline - time.monotonic()))
     url = f"{ACESTEP_API_URL}{path}"
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
@@ -372,6 +359,24 @@ def _audio_as_resource(file_path: str) -> tuple[Optional[EmbeddedResource], Opti
     )
 
 
+def _spoken_tempo(item: dict) -> tuple[str, str]:
+    """Return (bpm, key) as clean strings, empty when the engine reports none."""
+    metas = item.get("metas", {}) or {}
+    bpm_raw = str(metas.get("bpm", "") or "").strip()
+    key_raw = str(metas.get("keyscale", "") or "").strip()
+
+    bpm = ""
+    if bpm_raw and bpm_raw.lower() not in ("n/a", "none"):
+        try:
+            value = float(bpm_raw)
+            bpm = str(int(value)) if value.is_integer() else f"{value:g}"
+        except ValueError:
+            bpm = bpm_raw
+
+    key = "" if key_raw.lower() in ("n/a", "none") else key_raw
+    return bpm, key
+
+
 def _result_from_item(result: dict) -> CallToolResult:
     """Build the tool result for one generation item.
 
@@ -395,7 +400,14 @@ def _result_from_item(result: dict) -> CallToolResult:
         return _fail(reason or "failed", f"no attachable audio for task {task_id}")
 
     seconds = _spoken_duration(item)
-    line = f"Made a {seconds}s track." if seconds else "Made a track."
+    bpm, key = _spoken_tempo(item)
+    line = "Made a track" if not seconds else f"Made a {seconds}s track"
+    if bpm:
+        line += f" at {bpm} BPM"
+    if key:
+        line += f" in {key}"
+    line += "."
+
     return CallToolResult(content=[TextContent(type="text", text=line), audio])
 
 
@@ -480,7 +492,6 @@ def _generate_music(
     key: str,
 ) -> CallToolResult:
     """Generate one song and return either the audio or a still-rendering note."""
-    deadline = time.monotonic() + _TOOL_BUDGET_S
     body = {
         "prompt": prompt,
         "model": _MODEL_ID,
@@ -495,22 +506,21 @@ def _generate_music(
     if key:
         body["key_scale"] = key
 
-    result = _api_post("/release_task", body, timeout=_REQUEST_TIMEOUT_S, deadline=deadline)
+    result = _api_post("/release_task", body, timeout=120)
 
     data_blob = result.get("data", result) if isinstance(result, dict) else {}
     task_id = data_blob.get("task_id", "") if isinstance(data_blob, dict) else ""
     if not task_id:
         return _fail("failed", f"no task_id in release_task response: {str(result)[:200]}")
 
-    # Poll until done, but never past the tool budget.
-    while deadline - time.monotonic() > 3.0:
-        remaining = deadline - time.monotonic()
+    # Poll until done. The bot's own Patience setting is the outside limit.
+    start = time.time()
+    max_wait = 120
+    while time.time() - start < max_wait:
         try:
             poll_result = _api_post(
                 "/query_result",
                 {"task_id_list": json.dumps([task_id])},
-                timeout=min(remaining, 30.0),
-                deadline=deadline,
             )
         except (_StudioUnavailable, _StudioError) as exc:
             _log(f"poll failed for task {task_id}: {exc}")
@@ -523,7 +533,7 @@ def _generate_music(
                 return _complete_generation(ctx, data[0])
             if items and items[0].get("status") == 2:
                 return _fail("failed", f"generation status 2 for task {task_id}")
-        time.sleep(min(_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
+        time.sleep(_POLL_INTERVAL_S)
 
     return _say(_STILL_RENDERING.format(task_id=task_id))
 
