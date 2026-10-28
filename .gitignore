@@ -5,3 +5,6 @@ __pycache__/
 venv/
 *.egg-info/
 dist/
+imagine_music.log
+*.log
+*.swp

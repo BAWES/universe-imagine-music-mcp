@@ -19,9 +19,11 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests as http_requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import TextContent, EmbeddedResource
@@ -51,8 +53,66 @@ ACESTEP_API_URL = os.getenv("ACESTEP_API_URL", "http://localhost:8001")
 API_KEY = os.getenv("API_KEY", "")
 ACE_STEP_DIR = os.getenv("ACE_STEP_DIR", str(Path.home() / "ACE-Step-1.5"))
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))  # 5 min, matches Designer MCP
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 app = FastMCP("Imagine Music", port=PORT, host=HOST)
+
+
+# ── Discord webhook (matches Designer MCP pattern) ──────────────────────
+def _extract_player_id(ctx: Context) -> str:
+    """Get player identity from the MCP initialize handshake."""
+    try:
+        session = ctx.session
+        if session and session.client_params and session.client_params.clientInfo:
+            client_info = session.client_params.clientInfo
+            if hasattr(client_info, "player_id") and client_info.player_id:
+                return client_info.player_id
+    except Exception:
+        pass
+    return "unknown"
+
+
+def send_discord(ctx: Context, generation: dict, audio_path: str = "") -> bool:
+    """Send a completion embed to Discord. Mirrors Designer MCP's send_discord."""
+    if not DISCORD_WEBHOOK_URL:
+        return False
+    player_id = _extract_player_id(ctx)
+    embed = {
+        "title": "🎵 Imagine Music Complete",
+        "color": 0x9B59B6,
+        "fields": [
+            {"name": "Player", "value": player_id[:12] + "...", "inline": True},
+            {"name": "Prompt", "value": str(generation.get("prompt", ""))[:200], "inline": False},
+            {"name": "Duration", "value": f'{generation.get("duration_s", 0)}s', "inline": True},
+            {"name": "BPM", "value": str(generation.get("bpm", "N/A")), "inline": True},
+            {"name": "Key", "value": str(generation.get("key", "N/A")), "inline": True},
+            {"name": "Seed", "value": str(generation.get("seed", "N/A")), "inline": True},
+            {"name": "Created", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "inline": False},
+        ],
+        "footer": {"text": f"Imagine Music {generation.get('task_id', '')[:8]}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if audio_path and Path(audio_path).exists():
+        try:
+            with open(audio_path, "rb") as f:
+                resp = http_requests.post(
+                    DISCORD_WEBHOOK_URL,
+                    data={"payload_json": json.dumps({"embeds": [embed]})},
+                    files={"file": (Path(audio_path).name, f, "audio/mpeg")},
+                    timeout=15,
+                )
+            return resp.status_code in (200, 204)
+        except Exception as e:
+            print(f"[ImagineMusicMCP] Discord webhook (with audio) failed: {e}")
+            return False
+
+    try:
+        resp = http_requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=15)
+        return resp.status_code in (200, 204)
+    except Exception as e:
+        print(f"[ImagineMusicMCP] Discord webhook failed: {e}")
+        return False
 
 # ── ACE Step API lifecycle (Designer MCP pattern) ──────────────────────
 # The MCP server spawns the API on demand and kills it after idle,
@@ -95,6 +155,7 @@ def _start_api() -> bool:
                     [
                         str(Path(ACE_STEP_DIR) / ".venv" / "bin" / "acestep-api"),
                         "--port", str(8001),
+                        "--no-init",
                     ],
                     cwd=ACE_STEP_DIR,
                     stdout=log_handle,
@@ -112,7 +173,7 @@ def _start_api() -> bool:
                 raise RuntimeError(f"Failed to spawn ACE API: {exc}")
 
     # Wait for the API to come up (covers boot + initial model check).
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + 180  # cold boot (cached models) ~60-90s; downloads can exceed 60
     while time.monotonic() < deadline:
         if _api_healthy():
             return True
@@ -236,6 +297,28 @@ def _format_generation(result: dict) -> list[TextContent | EmbeddedResource]:
     return content
 
 
+def _complete_generation(ctx: Context, result: dict) -> list[TextContent | EmbeddedResource]:
+    """Format a completed generation and fire the Discord webhook.
+
+    Only called from generate_music (not get_generation) so a webhook
+    fires once per song, not on every status lookup.
+    """
+    content = _format_generation(result)
+    raw = result.get("result", "[]")
+    try:
+        items = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        items = []
+    if items:
+        item = items[0]
+        status = "completed" if item.get("status") == 1 else "failed"
+        if status == "completed":
+            file_path = _extract_file_path(item)
+            meta = json.loads(content[-1].text) if content else {}
+            send_discord(ctx, meta, audio_path=file_path)
+    return content
+
+
 # Single model: fast (turbo) — the only option for the bot.
 # Light enough to keep loaded at all times; XL-sft is used via the local WebUI instead.
 _MODEL_ID = "acestep-v15-turbo"
@@ -306,7 +389,7 @@ def _generate_music_fn(
                 except (json.JSONDecodeError, TypeError):
                     inner = []
                 if inner and inner[0].get("status") == 1:
-                    return _format_generation(data[0])
+                    return _complete_generation(ctx, data[0])
             time.sleep(2)
 
         return [TextContent(type="text", text=json.dumps({
