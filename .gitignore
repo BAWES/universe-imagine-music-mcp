@@ -8,3 +8,4 @@ dist/
 imagine_music.log
 *.log
 *.swp
+*.bak-*
